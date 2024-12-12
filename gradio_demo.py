@@ -4,26 +4,25 @@ import gradio as gr
 import numpy as np
 import torch
 import safetensors.torch as sf
-import db_examples
 
 from PIL import Image
 from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
 from diffusers import AutoencoderKL, UNet2DConditionModel, DDIMScheduler, EulerAncestralDiscreteScheduler, DPMSolverMultistepScheduler
 from diffusers.models.attention_processor import AttnProcessor2_0
 from transformers import CLIPTextModel, CLIPTokenizer
-from briarmbg import BriaRMBG
 from enum import Enum
 from torch.hub import download_url_to_file
 
 
 # 'stablediffusionapi/realistic-vision-v51'
 # 'runwayml/stable-diffusion-v1-5'
+
 sd15_name = 'stablediffusionapi/realistic-vision-v51'
 tokenizer = CLIPTokenizer.from_pretrained(sd15_name, subfolder="tokenizer")
 text_encoder = CLIPTextModel.from_pretrained(sd15_name, subfolder="text_encoder")
 vae = AutoencoderKL.from_pretrained(sd15_name, subfolder="vae")
 unet = UNet2DConditionModel.from_pretrained(sd15_name, subfolder="unet")
-rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4")
+# rmbg = BriaRMBG.from_pretrained("briaai/RMBG-1.4")
 
 # Change UNet
 
@@ -49,8 +48,8 @@ unet.forward = hooked_unet_forward
 
 # Load
 
-model_path = './models/iclight_sd15_fc.safetensors'
-
+script_dir = os.path.dirname(os.path.abspath(__file__))
+model_path = os.path.join(script_dir, "models/iclight_sd15_fc.safetensors")
 if not os.path.exists(model_path):
     download_url_to_file(url='https://huggingface.co/lllyasviel/ic-light/resolve/main/iclight_sd15_fc.safetensors', dst=model_path)
 
@@ -67,7 +66,7 @@ device = torch.device('cuda')
 text_encoder = text_encoder.to(device=device, dtype=torch.float16)
 vae = vae.to(device=device, dtype=torch.bfloat16)
 unet = unet.to(device=device, dtype=torch.float16)
-rmbg = rmbg.to(device=device, dtype=torch.float32)
+# rmbg = rmbg.to(device=device, dtype=torch.float32)
 
 # SDP
 
@@ -217,18 +216,31 @@ def resize_without_crop(image, target_width, target_height):
 
 
 @torch.inference_mode()
-def run_rmbg(img, sigma=0.0):
+def run_rmbg(img, img_a, sigma=0.0):
     H, W, C = img.shape
     assert C == 3
     k = (256.0 / float(H * W)) ** 0.5
-    feed = resize_without_crop(img, int(64 * round(W * k)), int(64 * round(H * k)))
-    feed = numpy2pytorch([feed]).to(device=device, dtype=torch.float32)
-    alpha = rmbg(feed)[0][0]
+    feed = resize_without_crop(img_a, int(64 * round(W * k)), int(64 * round(H * k)))
+    feed = torch.from_numpy(np.stack(feed, axis=0)).float() / 127.0 - 1.0
+    feed = feed[None,:,:]
+    feed = feed.to(device=device, dtype=torch.float32)
+    alpha = feed[None, :, :]
     alpha = torch.nn.functional.interpolate(alpha, size=(H, W), mode="bilinear")
     alpha = alpha.movedim(1, -1)[0]
     alpha = alpha.detach().float().cpu().numpy().clip(0, 1)
     result = 127 + (img.astype(np.float32) - 127 + sigma) * alpha
     return result.clip(0, 255).astype(np.uint8), alpha
+    # H, W, C = img.shape
+    # assert C == 3
+    # k = (256.0 / float(H * W)) ** 0.5
+    # feed = resize_without_crop(img, int(64 * round(W * k)), int(64 * round(H * k)))
+    # feed = numpy2pytorch([feed]).to(device=device, dtype=torch.float32)
+    # alpha = rmbg(feed)[0][0]
+    # alpha = torch.nn.functional.interpolate(alpha, size=(H, W), mode="bilinear")
+    # alpha = alpha.movedim(1, -1)[0]
+    # alpha = alpha.detach().float().cpu().numpy().clip(0, 1)
+    # result = 127 + (img.astype(np.float32) - 127 + sigma) * alpha
+    # return result.clip(0, 255).astype(np.uint8), alpha
 
 
 @torch.inference_mode()
@@ -335,10 +347,10 @@ def process(input_fg, prompt, image_width, image_height, num_samples, seed, step
 
     return pytorch2numpy(pixels)
 
-
+import cv2
 @torch.inference_mode()
-def process_relight(input_fg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, lowres_denoise, bg_source):
-    input_fg, matting = run_rmbg(input_fg)
+def process_relight(input_fg, input_a, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, lowres_denoise, bg_source):
+    input_fg, matting = run_rmbg(input_fg, input_a)
     results = process(input_fg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, lowres_denoise, bg_source)
     return input_fg, results
 
@@ -377,57 +389,57 @@ class BGSource(Enum):
     BOTTOM = "Bottom Light"
 
 
-block = gr.Blocks().queue()
-with block:
-    with gr.Row():
-        gr.Markdown("## IC-Light (Relighting with Foreground Condition)")
-    with gr.Row():
-        with gr.Column():
-            with gr.Row():
-                input_fg = gr.Image(source='upload', type="numpy", label="Image", height=480)
-                output_bg = gr.Image(type="numpy", label="Preprocessed Foreground", height=480)
-            prompt = gr.Textbox(label="Prompt")
-            bg_source = gr.Radio(choices=[e.value for e in BGSource],
-                                 value=BGSource.NONE.value,
-                                 label="Lighting Preference (Initial Latent)", type='value')
-            example_quick_subjects = gr.Dataset(samples=quick_subjects, label='Subject Quick List', samples_per_page=1000, components=[prompt])
-            example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Lighting Quick List', samples_per_page=1000, components=[prompt])
-            relight_button = gr.Button(value="Relight")
+# block = gr.Blocks().queue()
+# with block:
+#     with gr.Row():
+#         gr.Markdown("## IC-Light (Relighting with Foreground Condition)")
+#     with gr.Row():
+#         with gr.Column():
+#             with gr.Row():
+#                 input_fg = gr.Image(source='upload', type="numpy", label="Image", height=480)
+#                 output_bg = gr.Image(type="numpy", label="Preprocessed Foreground", height=480)
+#             prompt = gr.Textbox(label="Prompt")
+#             bg_source = gr.Radio(choices=[e.value for e in BGSource],
+#                                  value=BGSource.NONE.value,
+#                                  label="Lighting Preference (Initial Latent)", type='value')
+#             example_quick_subjects = gr.Dataset(samples=quick_subjects, label='Subject Quick List', samples_per_page=1000, components=[prompt])
+#             example_quick_prompts = gr.Dataset(samples=quick_prompts, label='Lighting Quick List', samples_per_page=1000, components=[prompt])
+#             relight_button = gr.Button(value="Relight")
 
-            with gr.Group():
-                with gr.Row():
-                    num_samples = gr.Slider(label="Images", minimum=1, maximum=12, value=1, step=1)
-                    seed = gr.Number(label="Seed", value=12345, precision=0)
+#             with gr.Group():
+#                 with gr.Row():
+#                     num_samples = gr.Slider(label="Images", minimum=1, maximum=12, value=1, step=1)
+#                     seed = gr.Number(label="Seed", value=12345, precision=0)
 
-                with gr.Row():
-                    image_width = gr.Slider(label="Image Width", minimum=256, maximum=1024, value=512, step=64)
-                    image_height = gr.Slider(label="Image Height", minimum=256, maximum=1024, value=640, step=64)
+#                 with gr.Row():
+#                     image_width = gr.Slider(label="Image Width", minimum=256, maximum=1024, value=512, step=64)
+#                     image_height = gr.Slider(label="Image Height", minimum=256, maximum=1024, value=640, step=64)
 
-            with gr.Accordion("Advanced options", open=False):
-                steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1)
-                cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=2, step=0.01)
-                lowres_denoise = gr.Slider(label="Lowres Denoise (for initial latent)", minimum=0.1, maximum=1.0, value=0.9, step=0.01)
-                highres_scale = gr.Slider(label="Highres Scale", minimum=1.0, maximum=3.0, value=1.5, step=0.01)
-                highres_denoise = gr.Slider(label="Highres Denoise", minimum=0.1, maximum=1.0, value=0.5, step=0.01)
-                a_prompt = gr.Textbox(label="Added Prompt", value='best quality')
-                n_prompt = gr.Textbox(label="Negative Prompt", value='lowres, bad anatomy, bad hands, cropped, worst quality')
-        with gr.Column():
-            result_gallery = gr.Gallery(height=832, object_fit='contain', label='Outputs')
-    with gr.Row():
-        dummy_image_for_outputs = gr.Image(visible=False, label='Result')
-        gr.Examples(
-            fn=lambda *args: ([args[-1]], None),
-            examples=db_examples.foreground_conditioned_examples,
-            inputs=[
-                input_fg, prompt, bg_source, image_width, image_height, seed, dummy_image_for_outputs
-            ],
-            outputs=[result_gallery, output_bg],
-            run_on_click=True, examples_per_page=1024
-        )
-    ips = [input_fg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, lowres_denoise, bg_source]
-    relight_button.click(fn=process_relight, inputs=ips, outputs=[output_bg, result_gallery])
-    example_quick_prompts.click(lambda x, y: ', '.join(y.split(', ')[:2] + [x[0]]), inputs=[example_quick_prompts, prompt], outputs=prompt, show_progress=False, queue=False)
-    example_quick_subjects.click(lambda x: x[0], inputs=example_quick_subjects, outputs=prompt, show_progress=False, queue=False)
+#             with gr.Accordion("Advanced options", open=False):
+#                 steps = gr.Slider(label="Steps", minimum=1, maximum=100, value=25, step=1)
+#                 cfg = gr.Slider(label="CFG Scale", minimum=1.0, maximum=32.0, value=2, step=0.01)
+#                 lowres_denoise = gr.Slider(label="Lowres Denoise (for initial latent)", minimum=0.1, maximum=1.0, value=0.9, step=0.01)
+#                 highres_scale = gr.Slider(label="Highres Scale", minimum=1.0, maximum=3.0, value=1.5, step=0.01)
+#                 highres_denoise = gr.Slider(label="Highres Denoise", minimum=0.1, maximum=1.0, value=0.5, step=0.01)
+#                 a_prompt = gr.Textbox(label="Added Prompt", value='best quality')
+#                 n_prompt = gr.Textbox(label="Negative Prompt", value='lowres, bad anatomy, bad hands, cropped, worst quality')
+#         with gr.Column():
+#             result_gallery = gr.Gallery(height=832, object_fit='contain', label='Outputs')
+#     with gr.Row():
+#         dummy_image_for_outputs = gr.Image(visible=False, label='Result')
+#         gr.Examples(
+#             fn=lambda *args: ([args[-1]], None),
+#             examples=db_examples.foreground_conditioned_examples,
+#             inputs=[
+#                 input_fg, prompt, bg_source, image_width, image_height, seed, dummy_image_for_outputs
+#             ],
+#             outputs=[result_gallery, output_bg],
+#             run_on_click=True, examples_per_page=1024
+#         )
+#     ips = [input_fg, prompt, image_width, image_height, num_samples, seed, steps, a_prompt, n_prompt, cfg, highres_scale, highres_denoise, lowres_denoise, bg_source]
+#     relight_button.click(fn=process_relight, inputs=ips, outputs=[output_bg, result_gallery])
+#     example_quick_prompts.click(lambda x, y: ', '.join(y.split(', ')[:2] + [x[0]]), inputs=[example_quick_prompts, prompt], outputs=prompt, show_progress=False, queue=False)
+#     example_quick_subjects.click(lambda x: x[0], inputs=example_quick_subjects, outputs=prompt, show_progress=False, queue=False)
 
 
-block.launch(server_name='0.0.0.0')
+# block.launch(server_name='0.0.0.0')

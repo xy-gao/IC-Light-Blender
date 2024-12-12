@@ -1,4 +1,3 @@
---extra-index-url https://download.pytorch.org/whl/cu124
 diffusers==0.27.2
 transformers==4.36.2
 opencv-python
